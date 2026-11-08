@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MileMates — Free Road Trip Planner</title>
+<meta name="description" content="Plan a road trip in India for free: day-by-day itinerary, night halts, stays, weather, fuel & cost split per person.">
+<meta name="theme-color" content="#0f4c4a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="css/styles.css">
+<script>
+  // apply saved theme before paint
+  try { const t = localStorage.getItem('mm-theme'); if (t) document.documentElement.dataset.theme = t; } catch {}
+</script>
+</head>
+<body>
+<header class="topbar">
+  <a class="logo" href="./" aria-label="MileMates home">
+    <span class="mark" aria-hidden="true">🚙</span>
+    <span>MileMates<small>Plan the drive. Split the fuel. Enjoy the ride.</small></span>
+  </a>
+  <nav>
+    <button class="navbtn" id="navPlan">Plan a trip</button>
+    <button class="navbtn" id="navTrips">My trips <span id="tripCount"></span></button>
+    <button class="navbtn hide-sm" id="navHow">How it works</button>
+    <button class="navbtn icon" id="themeBtn" aria-label="Toggle dark mode">🌙</button>
+  </nav>
+</header>
+
+<div class="wrap">
+  <!-- ============ TRIP FORM ============ -->
+  <aside class="card formcard" id="formCard">
+    <form id="tripForm" novalidate>
+      <h2>🗺️ Your road trip</h2>
+
+      <label class="lbl">Route</label>
+      <div id="places" class="places"></div>
+      <button type="button" class="addstop" id="addStop">+ Add a stop</button>
+
+      <div class="chips" role="radiogroup" aria-label="Trip type" data-field="roundTrip">
+        <button type="button" class="chip" data-value="true">↻ Round trip</button>
+        <button type="button" class="chip" data-value="false">→ One way</button>
+      </div>
+
+      <div class="row">
+        <div><label class="lbl" for="startDate">Start date</label><input class="inp" type="date" id="startDate" required></div>
+        <div><label class="lbl" for="endDate">End date</label><input class="inp" type="date" id="endDate" required></div>
+      </div>
+      <p class="hint" id="daysHint"></p>
+
+      <label class="lbl">Travellers</label>
+      <div class="inp stepper">
+        <button type="button" class="step" id="pplMinus" aria-label="Fewer people">−</button>
+        <b><span id="pplVal">4</span> <span id="pplWord">people</span></b>
+        <button type="button" class="step" id="pplPlus" aria-label="More people">+</button>
+      </div>
+
+      <label class="lbl">Vehicle</label>
+      <div class="chips" role="radiogroup" aria-label="Vehicle" data-field="vehicle" id="vehicleChips"></div>
+      <p class="hint" id="vehHint"></p>
+
+      <div class="row">
+        <div><label class="lbl" for="mileage">Mileage (km/l)</label><input class="inp" type="number" id="mileage" min="3" max="80" step="0.5" inputmode="decimal"></div>
+        <div><label class="lbl" for="fuelPrice">Fuel price (₹/litre)</label><input class="inp" type="number" id="fuelPrice" min="50" max="200" step="0.5" inputmode="decimal"></div>
+      </div>
+
+      <label class="lbl" for="maxHours">Max driving per day</label>
+      <input type="range" id="maxHours" min="3" max="10" step="0.5" class="range">
+      <div class="hint rangehint"><span>3 h</span><b id="maxHoursVal">6 hours</b><span>10 h</span></div>
+
+      <label class="lbl">Trip pace</label>
+      <div class="chips" role="radiogroup" aria-label="Trip pace" data-field="pace" id="paceChips"></div>
+
+      <label class="lbl">Budget style</label>
+      <div class="chips" role="radiogroup" aria-label="Budget style" data-field="budget" id="budgetChips"></div>
+
+      <p class="formerr" id="formErr" role="alert" hidden></p>
+      <button class="btn primary big" type="submit" id="planBtn">Plan my road trip →</button>
+      <p class="hint center">Free forever · no sign-up · data from OpenStreetMap &amp; Open-Meteo</p>
+    </form>
+  </aside>
+
+  <!-- ============ RESULTS ============ -->
+  <main class="main" id="main">
+    <!-- empty state -->
+    <section id="emptyState" class="empty card">
+      <div class="empty-art" aria-hidden="true">
+        <svg viewBox="0 0 400 160"><path d="M0 130 C80 120 120 60 200 70 C280 80 320 40 400 30" stroke="var(--orange)" stroke-width="6" fill="none" stroke-linecap="round" stroke-dasharray="14 12"/><circle cx="20" cy="128" r="10" fill="var(--teal)"/><circle cx="380" cy="32" r="12" fill="var(--orange)"/><text x="190" y="58" font-size="34">🚙</text></svg>
+      </div>
+      <h1>Where are we driving?</h1>
+      <p>Enter your start, destination, dates and group size. MileMates will split the drive into days, find night halts and stays, check the weather, and work out the fuel cost per person.</p>
+      <p class="hint">Or try a classic:</p>
+      <div class="examples" id="examples"></div>
+    </section>
+
+    <!-- loading -->
+    <section id="loading" class="card loading" hidden aria-live="polite">
+      <div class="spinner" aria-hidden="true">🚙</div>
+      <h2 id="loadTitle">Planning your trip…</h2>
+      <ol id="loadSteps" class="steps"></ol>
+    </section>
+
+    <!-- error -->
+    <section id="errorBox" class="card errorbox" hidden role="alert">
+      <h2>😕 Hit a pothole</h2>
+      <p id="errorMsg"></p>
+      <button class="btn primary" id="retryBtn">Try again</button>
+    </section>
+
+    <!-- results -->
+    <section id="results" hidden>
+      <div class="hero">
+        <div class="mapbox">
+          <div id="map" aria-label="Route map"></div>
+          <div class="maptag" id="mapTag"></div>
+          <div class="maplayers" id="mapLayers">
+            <label><input type="checkbox" data-layer="sights" checked> Sights</label>
+            <label><input type="checkbox" data-layer="fuel"> Fuel</label>
+            <label><input type="checkbox" data-layer="stays" checked> Stays</label>
+          </div>
+        </div>
+        <div class="summary">
+          <div class="trip-title">
+            <p id="readyNote">Your plan is ready ✨</p>
+            <h1 id="tripTitle" contenteditable="true" spellcheck="false" title="Click to rename"></h1>
+            <p id="tripMeta"></p>
+            <div class="acts">
+              <button class="pill" id="shareBtn">🔗 Share link</button>
+              <button class="pill" id="icsBtn">📅 Add to calendar</button>
+              <button class="pill" id="printBtn">🖨️ Print / PDF</button>
+              <button class="pill" id="saveBtn">💾 Save trip</button>
+            </div>
+          </div>
+          <div class="stats" id="stats"></div>
+        </div>
+      </div>
+
+      <div id="warnings"></div>
+
+      <div class="tabs" role="tablist" id="tabs">
+        <button role="tab" data-tab="itinerary" class="tab on">📍 Itinerary</button>
+        <button role="tab" data-tab="stays" class="tab">🛏 Where to stay</button>
+        <button role="tab" data-tab="costs" class="tab">💰 Costs</button>
+        <button role="tab" data-tab="packing" class="tab">🎒 Packing</button>
+        <button role="tab" data-tab="fuel" class="tab">⛽ Fuel stops</button>
+        <button role="tab" data-tab="fun" class="tab">🎲 Bingo &amp; fun</button>
+      </div>
+
+      <div class="panel" data-panel="itinerary"><div class="days" id="days"></div></div>
+      <div class="panel" data-panel="stays" hidden><div id="staysPanel"></div></div>
+      <div class="panel" data-panel="costs" hidden><div id="costsPanel"></div></div>
+      <div class="panel" data-panel="packing" hidden><div id="packingPanel"></div></div>
+      <div class="panel" data-panel="fuel" hidden><div id="fuelPanel"></div></div>
+      <div class="panel" data-panel="fun" hidden><div id="funPanel"></div></div>
+    </section>
+
+    <footer class="foot">
+      MileMates · 100% free · Maps © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a> ·
+      Weather by <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> · Routing by <a href="https://project-osrm.org/" target="_blank" rel="noopener">OSRM</a> ·
+      Search by <a href="https://photon.komoot.io/" target="_blank" rel="noopener">Photon</a> · Places from <a href="https://www.wikipedia.org/" target="_blank" rel="noopener">Wikipedia</a>
+      <br>Estimates only — always check road conditions and local advisories before you go.
+    </footer>
+  </main>
+</div>
+
+<!-- My trips -->
+<dialog id="tripsDlg" class="dlg">
+  <div class="dlghead"><h2>💾 My trips</h2><button class="x" data-close aria-label="Close">✕</button></div>
+  <div id="tripsList"></div>
+  <p class="hint">Trips are saved only in this browser. Use “Share link” to move a trip to another device.</p>
+</dialog>
+
+<!-- How it works -->
+<dialog id="howDlg" class="dlg">
+  <div class="dlghead"><h2>🧭 How MileMates works</h2><button class="x" data-close aria-label="Close">✕</button></div>
+  <ol class="how">
+    <li><b>Route:</b> the road route comes from OSRM on OpenStreetMap data. Drive times get a 20% buffer for Indian traffic, ghats and towns.</li>
+    <li><b>Days:</b> the drive is split so no day goes over your “max driving per day”. Night halts are snapped to real towns near each split point. Spare days become explore days at your destination.</li>
+    <li><b>Weather:</b> uses the live forecast for trips in the next 16 days. Further out, it shows what the weather was on the same dates last year.</li>
+    <li><b>Stays:</b> hotels, homestays, hostels and camps listed on OpenStreetMap near each night halt. Booking buttons open Booking.com, MakeMyTrip, Airbnb or Google Maps with your town, dates and guests filled in.</li>
+    <li><b>Costs:</b> fuel = distance ÷ mileage × fuel price × vehicles. Rooms are for 2 people each, tolls are a rough ₹/km estimate, and every rate can be edited.</li>
+    <li><b>Privacy:</b> there are no accounts and no servers of our own. Your trips stay in your browser.</li>
+  </ol>
+</dialog>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
