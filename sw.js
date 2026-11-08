@@ -1,5 +1,5 @@
 // Offline support: the app shell is cached; map data/API calls always go to the network.
-const VERSION = 'milemates-v2';
+const VERSION = 'milemates-v3';
 const SHELL = [
   './', 'index.html', 'css/styles.css', 'js/app.js', 'js/api.js', 'js/planner.js', 'js/util.js',
   'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png',

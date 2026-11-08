@@ -72,29 +72,52 @@ export async function route(points) {
 }
 
 // ---------------- Overpass ----------------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-export async function overpass(query) {
-  let lastErr;
-  for (const url of OVERPASS) {
-    // the public servers answer 429/503/504 when busy: wait and try once more before moving on
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        return await getJSON(url, { body: 'data=' + encodeURIComponent(query), minGap: 1000, timeout: 70000 });
-      } catch (e) {
-        lastErr = e;
-        if (!/ (429|503|504)$/.test(e.message) || attempt) break;
-        await sleep(4000);
-      }
-    }
-  }
-  throw lastErr;
+// Overpass public servers are often slow or busy. Instead of waiting on one server
+// for a long time, start with the main server and, if it hasn't answered after a few
+// seconds, ask the next mirror too. The first good answer wins; the whole thing is
+// capped so the page never "loads forever".
+const overpassCache = new Map();
+async function overpassOnce(url, query, signal) {
+  const res = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(query), signal,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+  if (!res.ok) throw new Error(`${new URL(url).host} answered ${res.status}`);
+  const d = await res.json();
+  // Overpass reports its own timeouts/overload as a 200 with a "remark"
+  if (d.remark && /timed out|runtime error|out of memory|rate_limited/i.test(d.remark) && !(d.elements || []).length) throw new Error(`${new URL(url).host}: ${d.remark}`);
+  return d;
+}
+export function overpass(query, { hedgeMs = 7000, capMs = 40000 } = {}) {
+  if (overpassCache.has(query)) return Promise.resolve(overpassCache.get(query));
+  return new Promise((resolve, reject) => {
+    const ctrls = [], errors = [], timers = [];
+    let next = 0, running = 0, done = false;
+    const finish = (err, val) => {
+      if (done) return; done = true;
+      timers.forEach(clearTimeout); ctrls.forEach((c) => c.abort());
+      if (err) reject(err); else { overpassCache.set(query, val); resolve(val); }
+    };
+    const launch = () => {
+      if (done || next >= OVERPASS.length) return;
+      const url = OVERPASS[next++], ctrl = new AbortController();
+      ctrls.push(ctrl); running++;
+      overpassOnce(url, query, ctrl.signal).then((v) => finish(null, v)).catch((e) => {
+        running--; if (done) return;
+        errors.push(e);
+        if (next < OVERPASS.length) launch(); // failed fast: try the next server now
+        else if (!running) finish(new Error('The free OpenStreetMap servers are busy right now. ' + (errors[0]?.message || '')));
+      });
+    };
+    launch();
+    timers.push(setTimeout(launch, hedgeMs), setTimeout(launch, hedgeMs * 2));
+    timers.push(setTimeout(() => finish(new Error('The free OpenStreetMap servers took too long to answer.')), capMs));
+  });
 }
 
 const around = (r, pts) => `around:${r},${pts.map(([a, b]) => `${a.toFixed(4)},${b.toFixed(4)}`).join(',')}`;
 const centerOf = (el) => (el.lat != null ? [el.lat, el.lon] : el.center ? [el.center.lat, el.center.lon] : null);
 
 export async function townsNear(points, radius = 35000) {
-  const q = `[out:json][timeout:40];(${points.map(([a, b]) => `node[place~"^(city|town)$"][name](around:${radius},${a.toFixed(4)},${b.toFixed(4)});`).join('')});out tags 600;`;
+  const q = `[out:json][timeout:30];(${points.map(([a, b]) => `node[place~"^(city|town)$"][name](around:${radius},${a.toFixed(4)},${b.toFixed(4)});`).join('')});out tags 600;`;
   const d = await overpass(q);
   return (d.elements || []).map((e) => ({
     name: e.tags['name:en'] || e.tags.name,
@@ -108,7 +131,7 @@ export async function townsNear(points, radius = 35000) {
 export async function poisAlong(coords) {
   const pts = simplifyTo(coords, 45);
   const near = around(2500, pts), close = around(1200, pts);
-  const q = `[out:json][timeout:60];
+  const q = `[out:json][timeout:35];
 (
   nwr[tourism~"^(attraction|viewpoint|museum|zoo|theme_park|gallery)$"][name](${near});
   nwr[historic~"^(fort|castle|monument|palace|ruins|archaeological_site|memorial)$"][name][wikidata](${near});
@@ -137,7 +160,7 @@ out center tags 40;`;
 
 const STAY_TYPES = 'hotel|guest_house|hostel|motel|camp_site|apartment|chalet|alpine_hut|resort';
 export async function staysNear(halts, radius = 7000) {
-  const q = `[out:json][timeout:60];(${halts.map((p) =>
+  const q = `[out:json][timeout:30];(${halts.map((p) =>
     `nwr[tourism~"^(${STAY_TYPES})$"][name](around:${radius},${p.lat.toFixed(4)},${p.lon.toFixed(4)});nwr[leisure=resort][name](around:${radius},${p.lat.toFixed(4)},${p.lon.toFixed(4)});`).join('')});out center tags 500;`;
   const d = await overpass(q);
   return (d.elements || []).map((e) => {
@@ -182,7 +205,8 @@ export async function weatherFor(requests) {
     out[r.i] = {
       source,
       code: D.weather_code[idx], max: D.temperature_2m_max[idx], min: D.temperature_2m_min[idx],
-      sunrise: D.sunrise[idx], sunset: D.sunset[idx], rain: D.precipitation_sum?.[idx] ?? 0,
+      // last-year data carries last year's date: keep the clock time, use the trip's date
+      sunrise: String(D.sunrise[idx]).replace(/^\d{4}-\d\d-\d\d/, r.date), sunset: String(D.sunset[idx]).replace(/^\d{4}-\d\d-\d\d/, r.date), rain: D.precipitation_sum?.[idx] ?? 0,
       rainProb: D.precipitation_probability_max?.[idx] ?? null, elevation: res.elevation,
     };
   };
