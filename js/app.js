@@ -5,7 +5,7 @@ import {
 import * as api from './api.js';
 import {
   VEHICLES, PACE, BUDGET, ROAD_BUFFER, TOLL_PER_KM, defaultTitle, short, buildTimeline, allocate, snapTargets, buildDays,
-  computeCosts, WMO, dayAdvice, leaveBy, packingList, bingoCard, bingoWin, nightsCount,
+  computeCosts, WMO, dayAdvice, leaveBy, dayTimes, packingList, bingoCard, bingoWin, nightsCount,
 } from './planner.js';
 
 /* =====================================================================
@@ -25,7 +25,10 @@ const form = {
   maxHours: 6,
   pace: 'balanced',
   budget: 'comfort',
+  timeMode: 'leave',
+  time: '07:00',
 };
+const DEFAULT_TIME = { leave: '07:00', reach: '17:00' };
 let trip = null;         // current planned trip (see plan())
 let planToken = 0;       // cancels stale async work when a new plan starts
 let lastInputs = null;   // for "Try again"
@@ -140,6 +143,10 @@ function syncForm() {
   $('#mileage').value = form.mileage;
   $('#fuelPrice').value = form.fuelPrice;
   $('#maxHours').value = form.maxHours;
+  $('#timeVal').value = form.time;
+  $('#timeHint').textContent = form.time
+    ? (form.timeMode === 'leave' ? `Start driving at ${fmtTime(form.time)} on each driving day` : `Reach each halt by ${fmtTime(form.time)} — we'll tell you when to leave`)
+    : '';
   $('#maxHoursVal').textContent = `${form.maxHours} hours`;
   const nights = nightsCount(form.start, form.end);
   $('#daysHint').textContent = nights >= 0 ? `${nights + 1} day${nights ? 's' : ''}, ${nights} night${nights === 1 ? '' : 's'}` : 'End date is before start date';
@@ -153,6 +160,12 @@ function bindForm() {
   setupChips($('#paceChips'), 'pace', PACE);
   setupChips($('#budgetChips'), 'budget', BUDGET);
   $$('.chips[data-field="roundTrip"] .chip').forEach((b) => b.addEventListener('click', () => { form.roundTrip = b.dataset.value === 'true'; syncForm(); }));
+  $$('.chips[data-field="timeMode"] .chip').forEach((b) => b.addEventListener('click', () => {
+    const m = b.dataset.value;
+    if (m !== form.timeMode && form.time === DEFAULT_TIME[form.timeMode]) form.time = DEFAULT_TIME[m];
+    form.timeMode = m; syncForm();
+  }));
+  $('#timeVal').addEventListener('change', (e) => { form.time = e.target.value; syncForm(); });
   $('#addStop').addEventListener('click', () => { form.places.splice(form.places.length - 1, 0, { name: '' }); renderPlaces(); $$('#places .inp')[form.places.length - 2]?.focus(); });
   $('#startDate').addEventListener('change', (e) => {
     const len = Math.max(0, nightsCount(form.start, form.end));
@@ -176,6 +189,7 @@ function validate() {
   if (!form.start || !form.end || isNaN(n)) err.push('Please pick your dates.');
   else if (n < 0) err.push('End date must be on or after the start date.');
   else if (n > 29) err.push('Trips can be up to 30 days long.');
+  if (!/^\d\d:\d\d$/.test(form.time || '')) err.push(form.timeMode === 'leave' ? 'Please pick a time to leave.' : 'Please pick a time to reach.');
   if (!(form.mileage > 0)) err.push('Please enter your vehicle mileage (km/l).');
   if (!(form.fuelPrice > 0)) err.push('Please enter the fuel price.');
   return err;
@@ -202,6 +216,8 @@ function showOnly(id) { ['emptyState', 'loading', 'errorBox', 'results'].forEach
 
 async function plan(inputs, saved = null) {
   const token = ++planToken;
+  inputs.timeMode ||= 'leave';
+  inputs.time ||= DEFAULT_TIME[inputs.timeMode];
   lastInputs = inputs;
   showOnly('loading');
   $('#planBtn').disabled = true;
@@ -246,7 +262,7 @@ async function plan(inputs, saved = null) {
       inputs, route, timeline, waypoints, destIndex, days,
       warnings: alloc.warnings,
       rates: saved?.rates || { fuelPrice: inputs.fuelPrice, mileage: inputs.mileage, room: B.room, food: B.food, tollPerKm: TOLL_PER_KM, buffer: false },
-      pins: saved?.pins || {}, packed: saved?.packed || {}, custom: saved?.custom || [],
+      pins: saved?.pins || {}, packed: saved?.packed || {}, custom: saved?.custom || [], times: saved?.times || {},
       bingo: saved?.bingo || { seed: Math.floor(Math.random() * 1e9), marks: [5] },
       weather: days.map(() => undefined), // undefined = loading, null = unavailable
       pois: days.map(() => undefined),
@@ -257,7 +273,7 @@ async function plan(inputs, saved = null) {
     renderResults();
     $('#planBtn').disabled = false;
     history.replaceState(null, '', location.pathname + '#trip=' + shareCode());
-    enrich(token);
+    enrich();
   } catch (e) {
     if (token !== planToken) return;
     console.error(e);
@@ -267,58 +283,76 @@ async function plan(inputs, saved = null) {
   }
 }
 
-// Background enrichment: weather → sights/fuel → stays → wiki
-async function enrich(token) {
-  const t = trip;
-  const alive = () => token === planToken && trip === t;
+// Background enrichment: weather → stays → sights/fuel → wiki.
+// Each loader can be re-run on its own from a "Retry" button.
+const alive = (t) => trip === t;
 
-  const wxReq = t.days.map((d) => ({ lat: d.to.lat, lon: d.to.lon, date: d.iso }));
-  api.weatherFor(wxReq).then((w) => {
-    if (!alive()) return;
+async function loadWeather(t = trip) {
+  t.weather = t.days.map(() => undefined);
+  renderDays();
+  try {
+    const w = await api.weatherFor(t.days.map((d) => ({ lat: d.to.lat, lon: d.to.lon, date: d.iso })));
+    if (!alive(t)) return;
     t.weather = w.map((x) => x || null);
-    renderDays(); renderPacking(); renderStats();
-  }).catch(() => { if (alive()) { t.weather = t.days.map(() => null); renderDays(); renderPacking(); } });
+  } catch (e) { console.warn(e); if (!alive(t)) return; t.weather = t.days.map(() => null); }
+  renderDays(); renderPacking(); renderStats(); renderFun();
+}
 
-  // stays for every night block (single Overpass call)
+async function loadStays(t = trip) {
   const blocks = nightBlocks();
-  const staysP = blocks.length
-    ? api.staysNear(blocks.map((b) => b.place)).then((all) => {
-      if (!alive()) return;
-      t.stays = blocks.map((b) => all
-        .map((s) => ({ ...s, dist: haversine([s.lat, s.lon], [b.place.lat, b.place.lon]) }))
-        .filter((s) => s.dist <= 8000)
-        .filter((s, i, arr) => arr.findIndex((x) => x.id === s.id || (x.name.toLowerCase() === s.name.toLowerCase() && haversine([x.lat, x.lon], [s.lat, s.lon]) < 300)) === i));
-      renderStays(); renderDays(); renderMapStays();
-    }).catch((e) => { console.warn(e); if (alive()) { t.stays = null; renderStays(); renderDays(); } })
-    : Promise.resolve((t.stays = []));
+  if (!blocks.length) { t.stays = []; return; }
+  t.stays = undefined;
+  renderStays(); renderDays();
+  try {
+    const all = await api.staysNear(blocks.map((b) => b.place));
+    if (!alive(t)) return;
+    t.stays = blocks.map((b) => all
+      .map((s) => ({ ...s, dist: haversine([s.lat, s.lon], [b.place.lat, b.place.lon]) }))
+      .filter((s) => s.dist <= 8000)
+      .filter((s, i, arr) => arr.findIndex((x) => x.id === s.id || (x.name.toLowerCase() === s.name.toLowerCase() && haversine([x.lat, x.lon], [s.lat, s.lon]) < 300)) === i));
+  } catch (e) { console.warn(e); if (!alive(t)) return; t.stays = null; }
+  renderStays(); renderDays(); renderMapStays();
+}
 
-  // sights / fuel / dhabas per driving day (sequential to be polite to Overpass)
-  await staysP;
-  for (let i = 0; i < t.days.length; i++) {
-    const d = t.days[i];
-    if (!alive()) return;
-    if (d.type !== 'drive') { t.pois[i] = { sights: [], fuel: [], food: [] }; continue; }
-    try {
-      const slice = t.timeline.coords.slice(d.a, d.b + 1);
-      const res = await api.poisAlong(slice);
-      res.fuel.forEach((f) => { f.km = t.timeline.dist[d.a + nearestIndex(slice, [f.lat, f.lon])] / 1000; });
-      t.pois[i] = res;
-    } catch (e) { console.warn(e); t.pois[i] = null; }
-    if (!alive()) return;
-    renderDay(i); renderMapPOIs(); renderFuel();
-  }
+async function loadPois(i, t = trip) {
+  const d = t.days[i];
+  if (d.type !== 'drive') { t.pois[i] = { sights: [], fuel: [], food: [] }; return; }
+  t.pois[i] = undefined;
+  renderDay(i);
+  try {
+    const slice = t.timeline.coords.slice(d.a, d.b + 1);
+    const res = await api.poisAlong(slice);
+    res.fuel.forEach((f) => { f.km = t.timeline.dist[d.a + nearestIndex(slice, [f.lat, f.lon])] / 1000; });
+    if (!alive(t)) return;
+    t.pois[i] = res;
+  } catch (e) { console.warn(e); if (!alive(t)) return; t.pois[i] = null; }
+  renderDay(i); renderMapPOIs(); renderFuel();
+}
 
-  // Wikipedia "things to do" at destination + rest-day places
+async function loadWiki(key, place, t = trip) {
+  t.wiki[key] = undefined;
+  renderDays();
+  try { const r = await api.wikiNear(place.lat, place.lon); if (!alive(t)) return; t.wiki[key] = r; }
+  catch (e) { console.warn(e); if (!alive(t)) return; t.wiki[key] = null; }
+  renderDays();
+}
+
+async function retryFailedPois(t = trip) {
+  for (let i = 0; i < t.days.length; i++) if (t.pois[i] === null && alive(t)) await loadPois(i, t);
+}
+
+async function enrich() {
+  const t = trip;
+  loadWeather(t);
+  await loadStays(t);
+  for (let i = 0; i < t.days.length && alive(t); i++) await loadPois(i, t);
   const wikiPlaces = new Map();
   t.days.forEach((d) => { if (d.type === 'rest') wikiPlaces.set(placeKey(d.to), d.to); });
-  const dest = t.waypoints[t.destIndex];
-  wikiPlaces.set(placeKey(dest), dest);
-  for (const [k, p] of wikiPlaces) {
-    try { t.wiki[k] = await api.wikiNear(p.lat, p.lon); } catch { t.wiki[k] = []; }
-    if (!alive()) return;
-    renderDays();
-  }
+  for (const [k, p] of wikiPlaces) if (alive(t)) await loadWiki(k, p, t);
 }
+
+const retryBtn = (label, fn) => h('button', { type: 'button', class: 'retry', onclick: (e) => { e.stopPropagation(); fn(); } }, `🔄 ${label}`);
+const fmtTime = (hm) => { const [a, b] = hm.split(':').map(Number); const d = new Date(); d.setHours(a, b, 0, 0); return clock(d); };
 
 const placeKey = (p) => `${(+p.lat).toFixed(3)},${(+p.lon).toFixed(3)}`;
 
@@ -467,9 +501,12 @@ function dayCard(i) {
     body.append(h('div', { class: 'meta', html: `<span>🛣️ <b>~30 km</b> local</span><span>🚶 at your pace</span>` }));
   }
 
+  // timing: leave at / reach by
+  if (d.type === 'drive') body.append(timingBlock(i, wx || null));
+
   // weather
   if (wx === undefined) body.append(h('div', { class: 'wx' }, h('div', { class: 'skeleton' })));
-  else if (wx === null) body.append(h('div', { class: 'wx' }, h('span', { class: 'ic' }, '🌡️'), h('span', { class: 'hint' }, 'Weather unavailable right now')));
+  else if (wx === null) body.append(h('div', { class: 'wx' }, h('span', { class: 'ic' }, '🌡️'), h('span', { class: 'hint' }, 'Weather didn’t load'), h('span', { style: 'margin-left:auto' }, retryBtn('Retry', () => loadWeather()))));
   else {
     const [ic, txt] = WMO(wx.code);
     body.append(h('div', { class: 'wx' },
@@ -477,10 +514,6 @@ function dayCard(i) {
       h('div', {}, h('b', {}, `${Math.round(wx.max)}° / ${Math.round(wx.min)}°`), h('br'), h('span', { class: 'hint' }, txt),
         h('span', { class: 'src' }, wx.source === 'forecast' ? `Forecast · ${short(d.to.name)}` : `Last year on this date · ${short(d.to.name)}`)),
       h('div', { class: 'sun' }, `🌅 ${clock(new Date(wx.sunrise))}`, h('br'), `🌇 ${clock(new Date(wx.sunset))}`)));
-    const lb = leaveBy(d, wx);
-    if (lb) body.append(h('div', { class: 'hint', html: lb.dark > 0
-      ? `🌙 Long day — leave by <b style="color:var(--ink)">${clock(lb.time)}</b>, still ~${dur(lb.dark * 60)} after dark`
-      : `⏰ Leave by <b style="color:var(--ink)">${clock(lb.time)}</b> to arrive before dark` }));
     dayAdvice(d, wx).forEach((n) => body.append(h('div', { class: 'note ' + n.level }, n.text)));
   }
   if (d.overMin > 10) body.append(h('div', { class: 'note warn' }, `⚠️ ${dur(d.overMin * 60)} over your ${trip.inputs.maxHours} h limit — add a day or raise the limit`));
@@ -495,7 +528,7 @@ function dayCard(i) {
       if (pois.fuel.length) row.append(h('span', { class: 'poi s' }, `⛽ ${pois.fuel.length} fuel stop${pois.fuel.length > 1 ? 's' : ''}`));
       if (!row.children.length) row.append(h('span', { class: 'hint' }, 'Open road — no listed sights on this stretch'));
       body.append(row);
-    }
+    } else body.append(h('div', { class: 'pois' }, h('span', { class: 'hint' }, 'Sights & fuel stops didn’t load'), retryBtn('Retry', () => loadPois(i))));
   } else {
     const list = trip.wiki[placeKey(d.to)];
     if (list === undefined) body.append(h('div', { class: 'pois' }, h('div', { class: 'skeleton' })));
@@ -505,7 +538,7 @@ function dayCard(i) {
         p.thumb ? h('img', { src: p.thumb, alt: '', loading: 'lazy' }) : h('span', { class: 'ph' }, '📍'),
         h('span', {}, p.title, h('small', {}, p.description)))));
       body.append(h('div', { class: 'hint' }, 'Things to see nearby'), w);
-    }
+    } else if (list === null) body.append(h('div', { class: 'pois' }, h('span', { class: 'hint' }, 'Things to see didn’t load'), retryBtn('Retry', () => loadWiki(placeKey(d.to), d.to))));
   }
 
   // links
@@ -521,7 +554,7 @@ function dayCard(i) {
     const block = nightBlocks()[bi];
     const pin = trip.pins[blockKey(block)];
     const count = trip.stays?.[bi]?.length;
-    const extra = pin ? `📌 ${pin.name}` : count ? `${count} stay${count > 1 ? 's' : ''} ›` : trip.stays === undefined ? '…' : 'stays ›';
+    const extra = pin ? `📌 ${pin.name}` : count ? `${count} stay${count > 1 ? 's' : ''} ›` : trip.stays === undefined ? '…' : trip.stays === null ? 'retry stays ›' : 'stays ›';
     body.append(h('div', { class: 'halt' },
       h('span', {}, '🛏 Night halt', h('button', { class: 'n2', type: 'button', onclick: () => { trip.stayView.block = bi; selectTab('stays'); renderStays(); } }, extra)),
       h('b', {}, short(d.to.name))));
@@ -529,6 +562,53 @@ function dayCard(i) {
   card.append(body);
   return card;
 }
+// ---------- leave / reach timing ----------
+function timingFor(i) {
+  const o = trip.times[i];
+  return { mode: o?.mode || trip.inputs.timeMode, time: o?.time || trip.inputs.time, custom: !!o };
+}
+function timingBlock(i, wx) {
+  const d = trip.days[i];
+  const tm = timingFor(i);
+  const { depart, arrive } = dayTimes(d, tm.mode, tm.time);
+  const dayShift = (t) => { const n = Math.round((new Date(t).setHours(0, 0, 0, 0) - new Date(d.date).setHours(0, 0, 0, 0)) / 864e5); return n ? ` (${n > 0 ? '+' : ''}${n} day)` : ''; };
+  const wrap = h('div', { class: 'timingwrap' });
+  const row = h('div', { class: 'timing' },
+    h('div', { class: tm.mode === 'leave' ? 'fixed' : '' }, h('small', {}, '🕗 Leave'), h('b', {}, clock(depart) + dayShift(depart)), h('span', {}, short(d.from.name))),
+    h('div', { class: 'mid' }, h('span', {}, dur(d.totalS)), h('small', {}, 'incl. breaks')),
+    h('div', { class: 'end ' + (tm.mode === 'reach' ? 'fixed' : '') }, h('small', {}, '🏁 Reach'), h('b', {}, clock(arrive) + dayShift(arrive)), h('span', {}, short(d.to.name))),
+    h('button', { type: 'button', class: 'edit', title: 'Change time for this day', 'aria-label': 'Change time for this day', 'aria-expanded': 'false', onclick: (e) => {
+      const ed = wrap.querySelector('.timeedit'); ed.hidden = !ed.hidden; e.currentTarget.setAttribute('aria-expanded', String(!ed.hidden));
+    } }, '✏️'));
+  const ed = h('div', { class: 'timeedit', hidden: true },
+    h('div', { class: 'chips' }, ['leave', 'reach'].map((m) => h('button', { type: 'button', class: 'chip' + (tm.mode === m ? ' on' : ''), onclick: () => setDayTime(i, m, tm.mode === m ? tm.time : DEFAULT_TIME[m]) }, m === 'leave' ? '🕗 Leave at' : '🏁 Reach by'))),
+    h('input', { class: 'inp', type: 'time', value: tm.time, step: 900, 'aria-label': tm.mode === 'leave' ? 'Leave at' : 'Reach by', onchange: (e) => e.target.value && setDayTime(i, tm.mode, e.target.value) }),
+    tm.custom ? h('button', { type: 'button', class: 'retry', onclick: () => { delete trip.times[i]; persist(); renderDay(i); } }, '↺ Use trip default') : null);
+  wrap.append(row, ed);
+
+  // sunlight advice for the chosen times
+  if (wx?.sunset) {
+    const sunset = new Date(wx.sunset), sunrise = wx.sunrise ? new Date(wx.sunrise) : null;
+    const lb = leaveBy(d, wx);
+    if (arrive > sunset) {
+      const late = (arrive - sunset) / 1000;
+      wrap.append(h('div', { class: 'note warn', html: lb && lb.dark <= 0
+        ? `🌙 Reaches ${dur(late)} after sunset (${clock(sunset)}). Leave by <b>${clock(lb.time)}</b> to arrive in daylight.`
+        : `🌙 Reaches ${dur(late)} after sunset (${clock(sunset)}) — a long day; some night driving is unavoidable.` }));
+    } else wrap.append(h('div', { class: 'hint' }, `☀️ Arrives ${dur((sunset - arrive) / 1000)} before sunset (${clock(sunset)})`));
+    if (sunrise && depart < sunrise) wrap.append(h('div', { class: 'note' }, `🌄 Starts before sunrise (${clock(sunrise)}) — first stretch in the dark`));
+  }
+  if (depart.getHours() < 4 && dayShift(depart) === '') wrap.append(h('div', { class: 'note warn' }, '😴 Very early start — make sure the driver sleeps well'));
+  return wrap;
+}
+function setDayTime(i, mode, time) {
+  if (mode === trip.inputs.timeMode && time === trip.inputs.time) delete trip.times[i];
+  else trip.times[i] = { mode, time };
+  persist(); renderDay(i);
+  const ed = $$('#days .day')[i]?.querySelector('.timeedit');
+  if (ed) { ed.hidden = false; ed.querySelector('input')?.focus(); }
+}
+
 const sightEmoji = (s) => {
   const t = s.tags || {};
   if (t.tourism === 'viewpoint') return '⛰️'; if (t.tourism === 'museum') return '🏛️'; if (t.historic === 'fort' || t.historic === 'castle') return '🏰';
@@ -617,7 +697,7 @@ function renderStays() {
   const grid = h('div', { class: 'staygrid' });
   const sl = h('div', { class: 'staylist' });
   if (list === undefined) for (let k = 0; k < 4; k++) sl.append(h('div', { class: 'stay' }, h('div', { class: 'skeleton' }), h('div', { class: 'skeleton', style: 'width:40%' })));
-  else if (list === null) sl.append(h('div', { class: 'emptylist' }, 'Couldn’t load stays right now (the free OpenStreetMap server is busy). Use the booking buttons →'));
+  else if (list === null) sl.append(h('div', { class: 'emptylist' }, h('p', {}, 'Couldn’t load stays right now — the free OpenStreetMap server is busy.'), h('p', { style: 'margin:10px 0' }, retryBtn('Try again', () => loadStays())), h('p', { class: 'hint' }, 'Or use the booking buttons.')));
   else {
     const pin = trip.pins[blockKey(b)];
     const minT = Math.min(...b.days.map((k) => trip.weather[k]?.min ?? 99));
@@ -745,6 +825,7 @@ function renderFuel() {
   const box = $('#fuelPanel');
   box.innerHTML = '';
   const loading = trip.pois.some((p, i) => p === undefined && trip.days[i].type === 'drive');
+  const failed = trip.pois.filter((p, i) => p === null && trip.days[i].type === 'drive').length;
   let all = trip.pois.flatMap((p) => p?.fuel || []).sort((a, b) => a.km - b.km);
   // one per 3 km stretch is enough
   const fuel = []; all.forEach((f) => { if (!fuel.length || f.km - fuel[fuel.length - 1].km > 3) fuel.push(f); });
@@ -753,6 +834,8 @@ function renderFuel() {
   const tank = trip.inputs.vehicle === 'bike' ? 13 : trip.inputs.vehicle === 'hatchback' ? 35 : 50;
   const range = tank * r.mileage;
   const card = h('div', { class: 'card' }, h('h2', {}, '⛽ Fuel stops along the way'));
+  if (failed) card.append(h('div', { class: 'note warn', style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px' },
+    `Fuel stations for ${failed} driving day${failed > 1 ? 's' : ''} didn’t load.`, retryBtn('Retry', () => retryFailedPois())));
   card.append(h('div', { class: 'facts' },
     h('div', { class: 'fact' }, h('b', {}, `${num(trip.costs?.litres || 0, 0)} l`), 'fuel for the whole trip'),
     h('div', { class: 'fact' }, h('b', {}, `~${num(range)} km`), `range on a full ${tank} l tank`),
@@ -838,7 +921,7 @@ function shareCode() {
   return b64urlEncode({
     p: I.places.map((p) => [p.name, p.detail || '', +(+p.lat).toFixed(5), +(+p.lon).toFixed(5)]),
     r: I.roundTrip ? 1 : 0, s: I.start, e: I.end, n: I.people, v: I.vehicle, m: trip.rates.mileage, f: trip.rates.fuelPrice,
-    h: I.maxHours, pc: I.pace, b: I.budget, t: trip.title,
+    h: I.maxHours, pc: I.pace, b: I.budget, t: trip.title, tm: I.timeMode, ti: I.time, ov: trip.times,
   });
 }
 function fromShareCode(code) {
@@ -847,16 +930,19 @@ function fromShareCode(code) {
     inputs: {
       places: o.p.map(([name, detail, lat, lon]) => ({ name, detail, lat, lon })), roundTrip: !!o.r, start: o.s, end: o.e,
       people: o.n, vehicle: o.v in VEHICLES ? o.v : 'suv', mileage: o.m, fuelPrice: o.f, maxHours: o.h, pace: o.pc in PACE ? o.pc : 'balanced', budget: o.b in BUDGET ? o.b : 'comfort',
+      timeMode: o.tm === 'reach' ? 'reach' : 'leave', time: /^\d\d:\d\d$/.test(o.ti || '') ? o.ti : '07:00',
     },
-    title: o.t,
+    title: o.t, times: o.ov && typeof o.ov === 'object' ? o.ov : {},
   };
 }
 
 function savedTrips() { return store.get('mm-trips', []); }
 function persist() {
-  if (!trip?.saved) return;
+  if (!trip) return;
+  try { history.replaceState(null, '', location.pathname + '#trip=' + shareCode()); } catch {}
+  if (!trip.saved) return;
   const list = savedTrips();
-  const rec = { id: trip.id, title: trip.title, inputs: trip.inputs, rates: trip.rates, pins: trip.pins, packed: trip.packed, custom: trip.custom, bingo: trip.bingo, savedAt: Date.now() };
+  const rec = { id: trip.id, title: trip.title, inputs: trip.inputs, rates: trip.rates, pins: trip.pins, packed: trip.packed, custom: trip.custom, bingo: trip.bingo, times: trip.times, savedAt: Date.now() };
   const i = list.findIndex((t) => t.id === trip.id);
   if (i >= 0) list[i] = rec; else list.unshift(rec);
   store.set('mm-trips', list.slice(0, 30));
@@ -889,20 +975,21 @@ function ics() {
   const esc2 = (s) => String(s).replace(/[\\;,]/g, (c) => '\\' + c).replace(/\n/g, '\\n');
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
   const ymd = (d) => isoDate(d).replace(/-/g, '');
+  const ymdhm = (d) => `${ymd(d)}T${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}00`;
   const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//MileMates//Road Trip Planner//EN', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', `X-WR-CALNAME:${esc2(trip.title)}`];
   trip.days.forEach((d, i) => {
     const wx = trip.weather[i];
     const sum = d.type === 'drive' ? `Day ${i + 1}: ${short(d.from.name)} → ${short(d.to.name)} (${km(d.distM)}, ${dur(d.driveS)})` : `Day ${i + 1}: Explore ${short(d.to.name)}`;
-    const lb = wx ? leaveBy(d, wx) : null;
+    const tt = d.type === 'drive' ? dayTimes(d, timingFor(i).mode, timingFor(i).time) : null;
     const desc = [
       trip.title,
       d.type === 'drive' ? `Drive ${km(d.distM)} · ${dur(d.driveS)} · ${d.breaks} breaks` : 'Rest / explore day',
-      lb ? `Leave by ${clock(lb.time)}` : '',
+      tt ? `Leave ${short(d.from.name)} ${clock(tt.depart)} → reach ${short(d.to.name)} ${clock(tt.arrive)}` : '',
       wx ? `Weather: ${WMO(wx.code)[1]}, ${Math.round(wx.max)}°/${Math.round(wx.min)}°` : '',
       d.final ? 'Trip ends' : `Night halt: ${short(d.to.name)}`,
       d.type === 'drive' ? `Navigate: ${navLink(d)}` : '',
     ].filter(Boolean).join('\n');
-    lines.push('BEGIN:VEVENT', `UID:${trip.id}-${i}@milemates`, `DTSTAMP:${stamp}`, `DTSTART;VALUE=DATE:${ymd(d.date)}`, `DTEND;VALUE=DATE:${ymd(addDays(d.date, 1))}`,
+    lines.push('BEGIN:VEVENT', `UID:${trip.id}-${i}@milemates`, `DTSTAMP:${stamp}`, ...(tt ? [`DTSTART:${ymdhm(tt.depart)}`, `DTEND:${ymdhm(tt.arrive)}`] : [`DTSTART;VALUE=DATE:${ymd(d.date)}`, `DTEND;VALUE=DATE:${ymd(addDays(d.date, 1))}`]),
       `SUMMARY:${esc2(sum)}`, `DESCRIPTION:${esc2(desc)}`, `LOCATION:${esc2(short(d.to.name))}`, 'END:VEVENT');
   });
   lines.push('END:VCALENDAR');
@@ -987,9 +1074,9 @@ function boot() {
   const m = location.hash.match(/trip=([\w-]+)/);
   if (m) {
     try {
-      const { inputs, title } = fromShareCode(m[1]);
+      const { inputs, title, times } = fromShareCode(m[1]);
       loadInputsToForm(inputs);
-      plan(JSON.parse(JSON.stringify(inputs)), { title });
+      plan(JSON.parse(JSON.stringify(inputs)), { title, times });
     } catch (e) { console.warn('bad share link', e); toast('That trip link looks broken — plan a new one!'); }
   }
 }

@@ -190,6 +190,32 @@ button.poi:hover { filter: brightness(.95); text-decoration: underline; }
 .wiki img, .wiki .ph { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; flex: none; background: var(--teal-soft); display: grid; place-items: center; }
 .wiki small { display: block; color: var(--muted); font-size: 11px; }
 
+/* timing */
+.timerow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 2px; }
+.timerow .chips { margin-top: 0; flex-wrap: nowrap; }
+.timerow .inp { flex: 1 1 130px; min-width: 130px; padding: 8px 10px; }
+.timingwrap { display: flex; flex-direction: column; gap: 6px; }
+.timing { display: grid; grid-template-columns: 1fr auto 1fr 30px; gap: 6px; align-items: center; background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 6px 8px 10px; }
+.timing > div { min-width: 0; }
+.timing small { display: block; font-size: 11px; color: var(--muted); font-weight: 600; }
+.timing b { display: block; font-size: 15px; white-space: nowrap; }
+.timing span { display: block; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timing .fixed b { color: var(--orange); }
+.timing .mid { text-align: center; color: var(--muted); }
+.timing .mid span { font-size: 12px; color: var(--ink); font-weight: 600; }
+.timing .mid small { font-weight: 400; font-size: 10px; }
+.timing .mid::before { content: "→"; display: block; color: var(--orange); font-weight: 700; }
+.timing .end { text-align: right; }
+.timing .edit { width: 30px; height: 30px; border-radius: 8px; font-size: 14px; }
+.timing .edit:hover { background: var(--teal-soft); }
+.timeedit { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; background: var(--teal-soft); border-radius: 10px; padding: 8px; }
+.timeedit .chips { margin-top: 0; }
+.timeedit .inp { width: 120px; min-height: 36px; padding: 6px 8px; }
+.retry { font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 8px; background: var(--orange); color: #fff; white-space: nowrap; }
+.retry:hover { filter: brightness(1.08); }
+.pois .retry { margin-left: auto; }
+.emptylist p { margin: 0; }
+
 /* ---------- stays ---------- */
 .stays .top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .stays .top h2 { margin: 0; }
@@ -318,7 +344,7 @@ button.poi:hover { filter: brightness(.95); text-decoration: underline; }
 @media print {
   @page { margin: 12mm; }
   body { background: #fff; color: #000; font-size: 12px; }
-  .topbar, .formcard, .tabs, .acts, .maplayers, .foot a, #toast, .addrow, .daylinks, .stay .acts2, .nights, .book a.bk, #newCard { display: none !important; }
+  .topbar, .formcard, .tabs, .acts, .maplayers, .foot a, #toast, .addrow, .daylinks, .stay .acts2, .retry, .timing .edit, .timeedit, .nights, .book a.bk, #newCard { display: none !important; }
   .wrap { display: block; padding: 0; }
   .panel { display: block !important; margin-top: 14px; break-inside: auto; }
   .mapbox { min-height: 300px; break-inside: avoid; }

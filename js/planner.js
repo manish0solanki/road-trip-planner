@@ -269,6 +269,17 @@ export function leaveBy(day, wx) {
   return { time: t, dark: 0, sunrise, sunset };
 }
 
+// Departure/arrival for a driving day. mode 'leave' anchors the start time,
+// 'reach' anchors the arrival time. totalS includes breaks and a meal stop.
+export function dayTimes(day, mode, hm) {
+  const [hh, mm] = String(hm || '07:00').split(':').map(Number);
+  const anchor = new Date(day.date); anchor.setHours(hh, mm, 0, 0);
+  const ms = (day.totalS || 0) * 1000;
+  return mode === 'reach'
+    ? { depart: new Date(anchor.getTime() - ms), arrive: anchor }
+    : { depart: anchor, arrive: new Date(anchor.getTime() + ms) };
+}
+
 // ---------------- packing ----------------
 export function packingList({ inputs, days, weather, routeM }) {
   const n = inputs.people;

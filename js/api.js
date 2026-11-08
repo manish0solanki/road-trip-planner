@@ -72,12 +72,20 @@ export async function route(points) {
 }
 
 // ---------------- Overpass ----------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export async function overpass(query) {
   let lastErr;
   for (const url of OVERPASS) {
-    try {
-      return await getJSON(url, { body: 'data=' + encodeURIComponent(query), minGap: 1000, timeout: 60000 });
-    } catch (e) { lastErr = e; }
+    // the public servers answer 429/503/504 when busy: wait and try once more before moving on
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await getJSON(url, { body: 'data=' + encodeURIComponent(query), minGap: 1000, timeout: 70000 });
+      } catch (e) {
+        lastErr = e;
+        if (!/ (429|503|504)$/.test(e.message) || attempt) break;
+        await sleep(4000);
+      }
+    }
   }
   throw lastErr;
 }
