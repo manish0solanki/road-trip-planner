@@ -2,15 +2,14 @@
 //  - Photon (komoot)         place search / autocomplete
 //  - Nominatim (OSM)         reverse geocoding fallback
 //  - OSRM public servers     driving route
-//  - Overpass API (OSM)      towns, sights, fuel, dhabas, stays
+//  - Photon nearby search    towns, stays, fuel, dhabas, sights (OSM data)
 //  - Open-Meteo              forecast + last-year weather, sunrise/sunset
 //  - Wikipedia               things to do near a place
-import { getJSON, simplifyTo } from './util.js';
+import { getJSON, cumulative } from './util.js';
 
 const PHOTON = 'https://photon.komoot.io';
 const NOMINATIM = 'https://nominatim.openstreetmap.org';
 const OSRM = ['https://router.project-osrm.org', 'https://routing.openstreetmap.de/routed-car'];
-const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
 
 // ---------------- places ----------------
 function photonLabel(p) {
@@ -71,111 +70,110 @@ export async function route(points) {
   throw new Error(`Routing service is busy or no road connects these places (${lastErr?.message || 'unknown error'}). Please try again in a minute.`);
 }
 
-// ---------------- Overpass ----------------
-// Overpass public servers are often slow or busy. Instead of waiting on one server
-// for a long time, start with the main server and, if it hasn't answered after a few
-// seconds, ask the next mirror too. The first good answer wins; the whole thing is
-// capped so the page never "loads forever".
-const overpassCache = new Map();
-async function overpassOnce(url, query, signal) {
-  const res = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(query), signal,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-  if (!res.ok) throw new Error(`${new URL(url).host} answered ${res.status}`);
-  const d = await res.json();
-  // Overpass reports its own timeouts/overload as a 200 with a "remark"
-  if (d.remark && /timed out|runtime error|out of memory|rate_limited/i.test(d.remark) && !(d.elements || []).length) throw new Error(`${new URL(url).host}: ${d.remark}`);
-  return d;
+// ---------------- nearby places (Photon + Wikipedia) ----------------
+// Photon's nearby search answers in well under a second, unlike the public Overpass
+// servers which often time out. We sample points along the route and ask Photon
+// (and Wikipedia for sights) what's around each one.
+
+// Run async tasks with limited concurrency; returns settled results.
+async function pool(items, n, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const worker = async () => {
+    while (i < items.length) {
+      const k = i++;
+      try { out[k] = { ok: true, v: await fn(items[k], k) }; } catch (e) { out[k] = { ok: false, e }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  return out;
 }
-export function overpass(query, { hedgeMs = 7000, capMs = 40000 } = {}) {
-  if (overpassCache.has(query)) return Promise.resolve(overpassCache.get(query));
-  return new Promise((resolve, reject) => {
-    const ctrls = [], errors = [], timers = [];
-    let next = 0, running = 0, done = false;
-    const finish = (err, val) => {
-      if (done) return; done = true;
-      timers.forEach(clearTimeout); ctrls.forEach((c) => c.abort());
-      if (err) reject(err); else { overpassCache.set(query, val); resolve(val); }
+// If most lookups failed, surface an error so the UI shows a Retry button.
+function okValues(results, what) {
+  const ok = results.filter((r) => r.ok);
+  if (results.length && ok.length < Math.ceil(results.length / 2)) throw new Error(`${what} didn't load: ${results.find((r) => !r.ok)?.e?.message || 'service busy'}`);
+  return ok.flatMap((r) => r.v);
+}
+
+async function nearby(lat, lon, { radiusKm, limit = 50, tags }) {
+  const url = `${PHOTON}/reverse?lat=${(+lat).toFixed(5)}&lon=${(+lon).toFixed(5)}&radius=${radiusKm}&limit=${limit}&lang=en&`
+    + tags.map((t) => 'osm_tag=' + encodeURIComponent(t)).join('&');
+  const d = await getJSON(url, { persist: true, timeout: 15000 });
+  return (d.features || []).map((f) => {
+    const p = f.properties || {};
+    return {
+      id: `${p.osm_type || 'X'}/${p.osm_id}`, name: p.name || '', key: p.osm_key, value: p.osm_value,
+      lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0],
+      street: p.street || '', locality: p.locality || p.district || '', city: p.city || p.town || p.village || p.county || '', state: p.state || '',
     };
-    const launch = () => {
-      if (done || next >= OVERPASS.length) return;
-      const url = OVERPASS[next++], ctrl = new AbortController();
-      ctrls.push(ctrl); running++;
-      overpassOnce(url, query, ctrl.signal).then((v) => finish(null, v)).catch((e) => {
-        running--; if (done) return;
-        errors.push(e);
-        if (next < OVERPASS.length) launch(); // failed fast: try the next server now
-        else if (!running) finish(new Error('The free OpenStreetMap servers are busy right now. ' + (errors[0]?.message || '')));
-      });
-    };
-    launch();
-    timers.push(setTimeout(launch, hedgeMs), setTimeout(launch, hedgeMs * 2));
-    timers.push(setTimeout(() => finish(new Error('The free OpenStreetMap servers took too long to answer.')), capMs));
   });
 }
 
-const around = (r, pts) => `around:${r},${pts.map(([a, b]) => `${a.toFixed(4)},${b.toFixed(4)}`).join(',')}`;
-const centerOf = (el) => (el.lat != null ? [el.lat, el.lon] : el.center ? [el.center.lat, el.center.lon] : null);
-
-export async function townsNear(points, radius = 35000) {
-  const q = `[out:json][timeout:30];(${points.map(([a, b]) => `node[place~"^(city|town)$"][name](around:${radius},${a.toFixed(4)},${b.toFixed(4)});`).join('')});out tags 600;`;
-  const d = await overpass(q);
-  return (d.elements || []).map((e) => ({
-    name: e.tags['name:en'] || e.tags.name,
-    lat: e.lat, lon: e.lon,
-    place: e.tags.place,
-    population: parseInt(String(e.tags.population || '0').replace(/\D/g, ''), 10) || 0,
-  }));
+// Points every `stepKm` along a path ([lat, lon][]), always including the end.
+function samplePath(coords, stepKm, max) {
+  const cum = cumulative(coords), total = cum[cum.length - 1];
+  const step = Math.max(stepKm * 1000, total / max);
+  const pts = [];
+  for (let d = step / 2, i = 0; d < total; d += step) { while (i < cum.length - 1 && cum[i] < d) i++; pts.push(coords[i]); }
+  if (!pts.length) pts.push(coords[Math.floor(coords.length / 2)]);
+  return pts;
 }
+
+const dedupe = (list) => { const seen = new Set(); return list.filter((x) => !seen.has(x.id) && seen.add(x.id)); };
+
+export async function townsNear(points, radiusKm = 30) {
+  const res = await pool(points, 3, ([lat, lon]) => nearby(lat, lon, { radiusKm, limit: 30, tags: ['place:city', 'place:town'] }));
+  return dedupe(okValues(res, 'Towns')).filter((t) => t.name).map((t) => ({ name: t.name, lat: t.lat, lon: t.lon, place: t.value, population: 0 }));
+}
+
+const SIGHT_TAGS = ['tourism:attraction', 'tourism:viewpoint', 'tourism:museum', 'tourism:zoo', 'tourism:theme_park', 'historic:fort', 'historic:castle',
+  'historic:monument', 'historic:palace', 'historic:ruins', 'historic:archaeological_site', 'natural:waterfall', 'natural:beach', 'natural:hot_spring'];
+const BORING = /^(city|town|village|census town|municipality|tehsil|taluk|suburb|area|neighbourhood|neighborhood|locality|human settlement|place in|district|railway station|bus station|school|college|university|hospital|airport|river|road|highway|national highway|constituency|lok sabha|vidhan sabha|state highway|mountain pass in)\b/i;
 
 // Sights, fuel and dhabas along one day's path.
 export async function poisAlong(coords) {
-  const pts = simplifyTo(coords, 45);
-  const near = around(2500, pts), close = around(1200, pts);
-  const q = `[out:json][timeout:35];
-(
-  nwr[tourism~"^(attraction|viewpoint|museum|zoo|theme_park|gallery)$"][name](${near});
-  nwr[historic~"^(fort|castle|monument|palace|ruins|archaeological_site|memorial)$"][name][wikidata](${near});
-  nwr[natural~"^(waterfall|beach|cave_entrance|hot_spring)$"][name](${near});
-  nwr[amenity=place_of_worship][name][wikidata](${close});
-);
-out center tags 60;
-node[amenity=fuel](${close});
-out tags 300;
-nwr[amenity~"^(restaurant|fast_food|food_court)$"][name~"dhaba|food plaza|food court|haveli",i](${close});
-out center tags 40;`;
-  const d = await overpass(q);
-  const sights = [], fuel = [], food = [];
-  for (const e of d.elements || []) {
-    const t = e.tags || {}, c = centerOf(e);
-    if (!c) continue;
-    const item = { id: `${e.type}/${e.id}`, name: t['name:en'] || t.name, lat: c[0], lon: c[1], tags: t };
-    if (t.amenity === 'fuel') fuel.push({ ...item, name: item.name || t.brand || t.operator || 'Fuel station' });
-    else if (/restaurant|fast_food|food_court/.test(t.amenity || '')) item.name && food.push(item);
-    else if (item.name) sights.push(item);
-  }
-  const score = (s) => (s.tags.wikipedia ? 3 : 0) + (s.tags.wikidata ? 2 : 0) + (s.tags.tourism === 'attraction' || s.tags.tourism === 'viewpoint' ? 1 : 0) + (s.tags.natural ? 1 : 0);
-  sights.sort((a, b) => score(b) - score(a));
+  const fuelPts = samplePath(coords, 25, 20);  // stations: a lookup every ~25 km
+  const sightPts = samplePath(coords, 50, 6);  // sparser for sights
+  const [fuelRes, sightRes, wikiRes] = await Promise.all([
+    pool(fuelPts, 3, ([a, b]) => nearby(a, b, { radiusKm: 4, limit: 25, tags: ['amenity:fuel', 'amenity:restaurant', 'amenity:fast_food'] })),
+    pool(sightPts, 2, ([a, b]) => nearby(a, b, { radiusKm: 8, limit: 15, tags: SIGHT_TAGS })),
+    pool(sightPts.filter((_, i) => i % 2 === 0), 2, ([a, b]) => wikiNear(a, b, 10000, 8)),
+  ]);
+  const places = dedupe(okValues(fuelRes, 'Fuel stops'));
+  const fuel = places.filter((p) => p.value === 'fuel').map((p) => ({ ...p, name: p.name || 'Fuel station', tags: { amenity: 'fuel' } }));
+  const foodNames = new Set();
+  const food = places.filter((p) => p.value !== 'fuel' && /dhaba|food plaza|food court|haveli|highway/i.test(p.name))
+    .filter((p) => !foodNames.has(p.name.toLowerCase()) && foodNames.add(p.name.toLowerCase()))
+    .map((p) => ({ ...p, tags: { amenity: p.value } }));
+  const osmSights = dedupe(sightRes.filter((r) => r.ok).flatMap((r) => r.v)).filter((s) => s.name).map((s) => ({ ...s, tags: { [s.key]: s.value } }));
+  const wiki = wikiRes.filter((r) => r.ok).flatMap((r) => r.v)
+    .filter((w) => w.lat != null && !BORING.test(w.description || ''))
+    .map((w) => ({ id: 'wiki/' + w.title, name: w.title, lat: w.lat, lon: w.lon, tags: { wikipedia: 'en:' + w.title, tourism: 'attraction' }, description: w.description, thumb: w.thumb }));
+  // Wikipedia-backed places first (they're notable), then OSM sights not already covered
+  const names = new Set(wiki.map((w) => w.name.toLowerCase()));
+  // drop near-duplicates like "X Waterfall Base" / "X Waterfall Upper View" and signboards
+  const stem = (n) => n.toLowerCase().replace(/\(.*?\)/g, '').split(/\s+/).slice(0, 2).join(' ');
+  const stems = new Set();
+  const sights = dedupe([...wiki, ...osmSights.filter((s) => !names.has(s.name.toLowerCase()))])
+    .filter((s) => !/^i love\b|selfie point|^entry|^exit|parking/i.test(s.name))
+    .filter((s) => !stems.has(stem(s.name)) && stems.add(stem(s.name)));
   return { sights, fuel, food };
 }
 
-const STAY_TYPES = 'hotel|guest_house|hostel|motel|camp_site|apartment|chalet|alpine_hut|resort';
-export async function staysNear(halts, radius = 7000) {
-  const q = `[out:json][timeout:30];(${halts.map((p) =>
-    `nwr[tourism~"^(${STAY_TYPES})$"][name](around:${radius},${p.lat.toFixed(4)},${p.lon.toFixed(4)});nwr[leisure=resort][name](around:${radius},${p.lat.toFixed(4)},${p.lon.toFixed(4)});`).join('')});out center tags 500;`;
-  const d = await overpass(q);
-  return (d.elements || []).map((e) => {
-    const t = e.tags || {}, c = centerOf(e);
-    return c && {
-      id: `${e.type}/${e.id}`, name: t['name:en'] || t.name, lat: c[0], lon: c[1],
-      type: t.leisure === 'resort' ? 'resort' : t.tourism,
-      stars: parseFloat(t.stars) || 0,
-      phone: t.phone || t['contact:phone'] || t['contact:mobile'] || '',
-      website: t.website || t['contact:website'] || t.url || '',
-      area: t['addr:suburb'] || t['addr:street'] || t['addr:city'] || t['addr:place'] || '',
-      rooms: parseInt(t.rooms, 10) || 0,
-      tags: t,
-    };
-  }).filter(Boolean);
+const STAY_TAGS = ['tourism:hotel', 'tourism:guest_house', 'tourism:hostel', 'tourism:motel', 'tourism:camp_site', 'tourism:apartment', 'tourism:chalet', 'tourism:alpine_hut', 'leisure:resort'];
+export async function staysNear(halts, radiusKm = 7) {
+  // small towns may have nothing listed close by: widen the search when results are thin
+  const res = await pool(halts, 2, async (p) => {
+    const r = await nearby(p.lat, p.lon, { radiusKm, limit: 50, tags: STAY_TAGS });
+    return r.filter((x) => x.name).length >= 6 ? r : nearby(p.lat, p.lon, { radiusKm: 25, limit: 50, tags: STAY_TAGS });
+  });
+  return dedupe(okValues(res, 'Stays')).filter((s) => s.name).map((s) => ({
+    id: s.id, name: s.name, lat: s.lat, lon: s.lon,
+    type: s.key === 'leisure' ? 'resort' : s.value,
+    stars: 0, phone: '', website: '', rooms: 0,
+    area: [s.street, s.locality || s.city].filter(Boolean).join(', '),
+    tags: { [s.key]: s.value },
+  }));
 }
 
 // ---------------- weather ----------------

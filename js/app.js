@@ -308,7 +308,7 @@ async function loadStays(t = trip) {
     if (!alive(t)) return;
     t.stays = blocks.map((b) => all
       .map((s) => ({ ...s, dist: haversine([s.lat, s.lon], [b.place.lat, b.place.lon]) }))
-      .filter((s) => s.dist <= 8000)
+      .filter((s) => s.dist <= 26000)
       .filter((s, i, arr) => arr.findIndex((x) => x.id === s.id || (x.name.toLowerCase() === s.name.toLowerCase() && haversine([x.lat, x.lon], [s.lat, s.lon]) < 300)) === i));
   } catch (e) { console.warn(e); if (!alive(t)) return; t.stays = null; }
   renderStays(); renderDays(); renderMapStays();
@@ -690,18 +690,17 @@ function renderStays() {
     const counts = Object.fromEntries(Object.keys(STAY_GROUP).map((k) => [k, list.filter(STAY_GROUP[k]).length]));
     card.append(h('div', { class: 'chips', style: 'margin:0 0 14px' },
       Object.keys(STAY_GROUP).filter((k) => k === 'all' || counts[k]).map((k) => h('button', { type: 'button', class: 'chip' + (v.type === k ? ' on' : ''), onclick: () => { v.type = k; renderStays(); } }, `${STAY_GROUP_LABEL[k]} (${counts[k]})`)),
-      h('button', { type: 'button', class: 'chip' + (v.contact ? ' on' : ''), onclick: () => { v.contact = !v.contact; renderStays(); } }, '📞 Has phone / website'),
       h('button', { type: 'button', class: 'chip' + (v.near ? ' on' : ''), onclick: () => { v.near = !v.near; renderStays(); } }, '📍 Within 3 km')));
   }
 
   const grid = h('div', { class: 'staygrid' });
   const sl = h('div', { class: 'staylist' });
   if (list === undefined) for (let k = 0; k < 4; k++) sl.append(h('div', { class: 'stay' }, h('div', { class: 'skeleton' }), h('div', { class: 'skeleton', style: 'width:40%' })));
-  else if (list === null) sl.append(h('div', { class: 'emptylist' }, h('p', {}, 'Couldn’t load stays right now — the free OpenStreetMap server is busy.'), h('p', { style: 'margin:10px 0' }, retryBtn('Try again', () => loadStays())), h('p', { class: 'hint' }, 'Or use the booking buttons.')));
+  else if (list === null) sl.append(h('div', { class: 'emptylist' }, h('p', {}, 'Couldn’t load stays right now — the free map service is busy.'), h('p', { style: 'margin:10px 0' }, retryBtn('Try again', () => loadStays())), h('p', { class: 'hint' }, 'Or use the booking buttons.')));
   else {
     const pin = trip.pins[blockKey(b)];
     const minT = Math.min(...b.days.map((k) => trip.weather[k]?.min ?? 99));
-    let shown = list.filter(STAY_GROUP[v.type]).filter((s) => !v.contact || s.phone || s.website).filter((s) => !v.near || s.dist <= 3000);
+    let shown = list.filter(STAY_GROUP[v.type]).filter((s) => !v.near || s.dist <= 3000);
     shown.sort((x, y) => (pin?.id === y.id) - (pin?.id === x.id)
       || fitsBudget(y, trip.inputs.budget) - fitsBudget(x, trip.inputs.budget)
       || (!!(y.phone || y.website)) - (!!(x.phone || x.website))
@@ -717,7 +716,7 @@ function renderStays() {
     h('div', { class: 'q', html: `${esc(short(b.place.name))} · <b>${fmtShort(b.checkin)} → ${fmtShort(b.checkout)}</b> · ${b.nights} night${b.nights > 1 ? 's' : ''}<br>${trip.inputs.people} adult${trip.inputs.people > 1 ? 's' : ''} · ${rooms} room${rooms > 1 ? 's' : ''}` }),
     bookingLinks(b).map(([ic, name, url]) => h('a', { class: 'bk', href: url, target: '_blank', rel: 'noopener' }, `${ic} ${name}`, h('span', {}, '↗'))),
     h('div', { class: 'est' }, h('span', {}, `Stay estimate (${BUDGET[trip.inputs.budget].label})`, h('br'), h('span', { style: 'opacity:.75' }, `${rooms} room${rooms > 1 ? 's' : ''} × ${b.nights} night${b.nights > 1 ? 's' : ''} × ${rupees(trip.rates.room)}`)), h('b', {}, rupees(est))),
-    h('div', { class: 'hint' }, 'Listings are free OpenStreetMap data. Live prices open on the booking site.'));
+    h('div', { class: 'hint' }, 'Listings are free OpenStreetMap data (via Photon). Live prices, photos and reviews open on the booking site.'));
   grid.append(sl, book);
   card.append(grid);
   box.append(card);
@@ -733,6 +732,7 @@ function stayCard(s, b, pin, minT) {
   const acts = h('div', { class: 'acts2' }, h('a', { href: gmaps(s.lat, s.lon, `${s.name} ${short(b.place.name)}`), target: '_blank', rel: 'noopener' }, '🗺️ Map'));
   if (s.website) acts.append(h('a', { href: /^https?:/.test(s.website) ? s.website : 'https://' + s.website, target: '_blank', rel: 'noopener nofollow' }, '🌐 Website'));
   if (s.phone) acts.append(h('a', { href: 'tel:' + s.phone.split(/[;,]/)[0].replace(/[^\d+]/g, '') }, '📞 Call'));
+  acts.append(h('a', { href: `https://www.google.com/search?q=${encodeURIComponent(`${s.name} ${short(b.place.name)} reviews`)}`, target: '_blank', rel: 'noopener' }, '🔎 Reviews'));
   acts.append(h('button', { type: 'button', class: 'pin', onclick: () => {
     const k = blockKey(b);
     if (pinned) delete trip.pins[k]; else trip.pins[k] = { id: s.id, name: s.name, lat: s.lat, lon: s.lon };
@@ -741,9 +741,9 @@ function stayCard(s, b, pin, minT) {
   } }, pinned ? '✓ Pinned' : '📌 Pin'));
   return h('div', { class: 'stay' + (pinned ? ' pinned' : '') },
     h('div', { class: 't' }, h('div', { class: 'thumb' }, STAY_ICON[s.type] || '🏨'),
-      h('div', {}, h('div', { class: 'nm' }, s.name), h('div', { class: 'ty' }, [STAY_LABEL[s.type] || 'Stay', s.area].filter(Boolean).join(' · '))),
-      s.stars ? h('span', { class: 'stars', 'aria-label': `${s.stars} stars` }, '★'.repeat(Math.round(s.stars)) + '☆'.repeat(Math.max(0, 5 - Math.round(s.stars)))) : h('span', { class: 'stars none' }, 'no rating')),
-    h('div', { class: 'info', html: `<span>📍 <b>${km(s.dist)}</b> from centre</span>${s.phone ? '<span>📞 listed</span>' : ''}${s.website ? '<span>🌐 listed</span>' : ''}` }),
+      h('div', {}, h('div', { class: 'nm' }, s.name), h('div', { class: 'ty' }, STAY_LABEL[s.type] || 'Stay')),
+      s.stars ? h('span', { class: 'stars', 'aria-label': `${s.stars} stars` }, '★'.repeat(Math.round(s.stars)) + '☆'.repeat(Math.max(0, 5 - Math.round(s.stars)))) : null),
+    h('div', { class: 'info', html: `<span>📍 <b>${km(s.dist)}</b> from ${esc(short(b.place.name))}</span>${s.area ? `<span>${esc(s.area)}</span>` : ''}` }),
     badges.length ? h('div', { class: 'badges' }, badges) : null,
     acts);
 }

@@ -22,7 +22,7 @@ Enter your start, destination, any stops, your dates and how many people are goi
 | Map tiles | OpenStreetMap + [Leaflet](https://leafletjs.com) (bundled in `vendor/`) |
 | Place search | [Photon](https://photon.komoot.io) (OpenStreetMap) |
 | Driving route | [OSRM](https://project-osrm.org) public servers |
-| Towns, sights, fuel, stays | [Overpass API](https://overpass-api.de) (OpenStreetMap) |
+| Towns, stays, fuel, dhabas, sights | [Photon](https://photon.komoot.io) nearby search on OpenStreetMap data + Wikipedia |
 | Weather, sunrise and sunset | [Open-Meteo](https://open-meteo.com) |
 | Things to do | Wikipedia geosearch |
 | Hosting | GitHub Pages |
